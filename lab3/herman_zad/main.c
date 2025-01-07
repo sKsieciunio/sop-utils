@@ -7,46 +7,84 @@
 #include <dirent.h>
 #include <sys/stat.h>
 #include <string.h>
+#include <stdbool.h>
 #include "utils.h"
 #include "circular_buffer.h"
 
 #define THREAD_COUNT 5
+#define BUFFER_SIZE 5
 
 typedef struct
 {
     pthread_t thread;
     CircularBuffer_t *cb;
-
+    int *pTotalFiles;
+    int *pProcessedFiles;
+    pthread_mutex_t *pmxTotal;
+    pthread_mutex_t *pmxProcessed;
+    bool *endFlag;
+    pthread_mutex_t *pmxEndFlag;
 } argsConsumer_t;
 
-void scan_directory(const char *dir_path, CircularBuffer_t *cb);
+void scan_directory(const char *dir_path, CircularBuffer_t *cb, int *totalFiles, pthread_mutex_t *mxTotal);
 void *consumer(void *arg);
 
 int main(int argc, char const *argv[])
 {
-    CircularBuffer_t *cb = (CircularBuffer_t *)malloc(sizeof(CircularBuffer_t));
-    cb_init(cb, 5);
+    CircularBuffer_t *cb = (CircularBuffer_t *)malloc(sizeof(CircularBuffer_t) * THREAD_COUNT);
+    cb_init(cb, BUFFER_SIZE);
 
-    argsConsumer_t *args = (argsConsumer_t *)malloc(sizeof(argsConsumer_t));
-    args->cb = cb;
+    int totalFiles = 0, processedFiles = 0;
+    pthread_mutex_t mxTotal = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_t mxProcessed = PTHREAD_MUTEX_INITIALIZER;
 
-    pthread_t threads[THREAD_COUNT];
+    bool endFlag = false;
+    pthread_mutex_t mxEndFlag = PTHREAD_MUTEX_INITIALIZER;
+
+    argsConsumer_t *args = (argsConsumer_t *)malloc(sizeof(argsConsumer_t) * THREAD_COUNT);
+
     for (int i = 0; i < THREAD_COUNT; i++)
     {
-        if (pthread_create(&threads[i], NULL, consumer, args) != 0)
+        args[i].cb = cb;
+        args[i].pTotalFiles = &totalFiles;
+        args[i].pProcessedFiles = &processedFiles;
+        args[i].pmxTotal = &mxTotal; 
+        args[i].pmxProcessed = &mxProcessed;
+        args[i].endFlag = &endFlag;
+        args[i].pmxEndFlag = &mxEndFlag;
+    }
+
+    for (int i = 0; i < THREAD_COUNT; i++)
+    {
+        if (pthread_create(&args[i].thread, NULL, consumer, &args[i]) != 0)
             ERR("pthread_create");
     }
 
-    scan_directory("./data1", cb);
+    scan_directory("./data1", cb, &totalFiles, &mxTotal);
 
-    while(!cb_is_empty(cb))
-        ;
+    while (1)
+    {
+        pthread_mutex_lock(&mxProcessed);
+        if (processedFiles == totalFiles)
+        {
+            pthread_mutex_unlock(&mxProcessed);
+            pthread_mutex_lock(&mxEndFlag);
+            endFlag = true;
+            pthread_mutex_unlock(&mxEndFlag);
+            printf("End flag set\n");
+            break;
+        }
+        pthread_mutex_unlock(&mxProcessed);
+        usleep(5000);
+    }
+
+    printf("All files processed\n");
 
     for (int i = 0; i < THREAD_COUNT; i++)
     {
-        pthread_cancel(threads[i]);
-        if (pthread_join(threads[i], NULL) != 0)
+        if (pthread_join(args[i].thread, NULL) != 0)
             ERR("pthread_join");
+        printf("Thread %d joined\n", i);
     }
 
 }
@@ -55,15 +93,18 @@ void *consumer(void *arg)
 {
     argsConsumer_t *args = (argsConsumer_t *)arg;
 
-    pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
-    pthread_setcanceltype(PTHREAD_CANCEL_DEFERRED, NULL);
-
     while (1)
     {
+        pthread_mutex_lock(args->pmxEndFlag);
+        bool endFlag = *(args->endFlag);
+        pthread_mutex_unlock(args->pmxEndFlag);
+
+        printf("End flag: %d\n", endFlag);
+        printf("Buffer empty: %d\n", cb_is_empty(args->cb));
+        if (endFlag && cb_is_empty(args->cb))
+            break;
+
         char *path = NULL;
-
-        pthread_cleanup_push(free, path);
-
         cb_pop(args->cb, &path);
         if (path == NULL)
             ERR("cb_pop");
@@ -71,8 +112,6 @@ void *consumer(void *arg)
         FILE *file = fopen(path, "r");
         if (file == NULL)
             ERR("fopen");
-
-        pthread_cleanup_push((void (*)(void *))fclose, file);
 
         int count[26] = {0};
         char c;
@@ -91,14 +130,18 @@ void *consumer(void *arg)
                 printf("%c: %d\n", 'a' + i, count[i]);
         }
 
-        pthread_cleanup_pop(1);
-        pthread_cleanup_pop(1);
+        pthread_mutex_lock(args->pmxProcessed);
+        (*args->pProcessedFiles)++;
+        pthread_mutex_unlock(args->pmxProcessed);
+
+        fclose(file);
+        free(path);
     }
 
     return NULL;
 }
 
-void scan_directory(const char *dir_path, CircularBuffer_t *cb) {
+void scan_directory(const char *dir_path, CircularBuffer_t *cb, int *totalFiles, pthread_mutex_t *mxTotal) {
 
     struct dirent *entry;
     DIR *dir = opendir(dir_path);
@@ -112,18 +155,22 @@ void scan_directory(const char *dir_path, CircularBuffer_t *cb) {
             continue;
 
         char path[256];
-        snprintf(path, sizeof(path), "%s/%s", dir_path, entry->d_name);
+        if (snprintf(path, sizeof(path), "%s/%s", dir_path, entry->d_name) >= sizeof(path))
+            ERR("snprintf");
 
         struct stat st;
         if (stat(path, &st) == -1)
             ERR("stat");
 
         if (S_ISDIR(st.st_mode))
-            scan_directory(path, cb);
+            scan_directory(path, cb, totalFiles, mxTotal);
         else if (S_ISREG(st.st_mode))
             if (strstr(entry->d_name, ".txt") != NULL)
             {
                 cb_push(cb, path);
+                pthread_mutex_lock(mxTotal);
+                (*totalFiles)++;
+                pthread_mutex_unlock(mxTotal);
                 printf("Pushed %s\n", path);
             }
     }
